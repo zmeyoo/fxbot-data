@@ -1,0 +1,123 @@
+name: Dukascopy endpoint diagnostic
+run-name: Dukascopy endpoint probe EURUSD 2024-03-04 12:00 UTC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe endpoints and preserve response evidence
+        shell: bash
+        run: |
+          set +e
+          mkdir -p probe
+          printf 'Dukascopy endpoint diagnostic\nUTC: %s\nRunner: %s\n' "$(date -u +%FT%TZ)" "$(uname -a)" > probe/REPORT.txt
+
+          probe_url() {
+            label="$1"
+            url="$2"
+            dir="probe/$label"
+            mkdir -p "$dir"
+            echo "=== $label ===" | tee -a probe/REPORT.txt
+            echo "URL: $url" | tee -a probe/REPORT.txt
+            http_code="$(curl --location --silent --show-error --compressed \
+              --connect-timeout 15 --max-time 60 \
+              --retry 2 --retry-all-errors --retry-delay 3 \
+              --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36' \
+              --header 'Accept: application/json, text/plain, */*' \
+              --header 'Accept-Language: en-US,en;q=0.9' \
+              --header 'Referer: https://www.dukascopy.com/' \
+              --header 'Origin: https://www.dukascopy.com' \
+              --dump-header "$dir/headers.txt" \
+              --output "$dir/body.bin" \
+              --write-out '%{http_code}' "$url" 2>"$dir/curl_stderr.txt")"
+            curl_rc=$?
+            echo "HTTP status: ${http_code:-none}" | tee -a probe/REPORT.txt
+            echo "curl exit: $curl_rc" | tee -a probe/REPORT.txt
+            echo "body bytes: $(wc -c < "$dir/body.bin" 2>/dev/null || echo 0)" | tee -a probe/REPORT.txt
+            grep -iE '^(content-type|content-length|x-amzn-waf-action|retry-after):' "$dir/headers.txt" 2>/dev/null | tee -a probe/REPORT.txt
+            if [ -f "$dir/body.bin" ]; then
+              file "$dir/body.bin" | tee -a probe/REPORT.txt
+              head -c 1000 "$dir/body.bin" > "$dir/body_preview.txt"
+              sha256sum "$dir/body.bin" | tee "$dir/body.sha256"
+            fi
+            echo "curl stderr:" >> probe/REPORT.txt
+            cat "$dir/curl_stderr.txt" >> probe/REPORT.txt 2>/dev/null
+            echo >> probe/REPORT.txt
+            printf '%s' "$http_code" > "$dir/http_status.txt"
+          }
+
+          # Legacy BI5 source: known to have timed out in the previous run.
+          probe_url legacy_datafeed 'https://datafeed.dukascopy.com/datafeed/EURUSD/2024/02/04/12h_ticks.bi5'
+          # Historical alternate host.
+          probe_url www_datafeed 'https://www.dukascopy.com/datafeed/EURUSD/2024/02/04/12h_ticks.bi5'
+          # JETTA API: calendar month is 1-based; instrument code is EUR-USD.
+          # Referer and Origin are important: the endpoint is protected by AWS WAF.
+          probe_url jetta_ticks 'https://jetta.dukascopy.com/v1/ticks/EUR-USD/2024/3/4/12'
+          probe_url jetta_instruments 'https://jetta.dukascopy.com/v1/instruments'
+
+          echo '=== DNS ===' >> probe/REPORT.txt
+          for host in datafeed.dukascopy.com www.dukascopy.com jetta.dukascopy.com; do
+            echo "-- $host" >> probe/REPORT.txt
+            getent ahosts "$host" >> probe/REPORT.txt 2>&1 || true
+          done
+
+          echo '=== SHA256 ===' >> probe/REPORT.txt
+          find probe -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > probe/SHA256SUMS.txt
+          cat probe/REPORT.txt
+
+      - name: Validate whether any tick endpoint returned usable data
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          root = pathlib.Path("probe")
+          usable = []
+          for name in ("legacy_datafeed", "www_datafeed"):
+              d = root / name
+              status = (d / "http_status.txt").read_text().strip() if (d / "http_status.txt").exists() else ""
+              body = d / "body.bin"
+              headers = (d / "headers.txt").read_text(errors="replace").lower() if (d / "headers.txt").exists() else ""
+              if status == "200" and body.exists() and body.stat().st_size > 0:
+                  sample = body.read_bytes()[:512].lstrip().lower()
+                  if b"<html" not in sample and b"challenge" not in sample and "x-amzn-waf-action: challenge" not in headers:
+                      usable.append(name + " (HTTP 200 binary response; decoder verification still required)")
+          d = root / "jetta_ticks"
+          status = (d / "http_status.txt").read_text().strip() if (d / "http_status.txt").exists() else ""
+          body = d / "body.bin"
+          if status == "200" and body.exists() and body.stat().st_size > 0:
+              try:
+                  payload = json.loads(body.read_text())
+                  required = {"timestamp", "multiplier", "bid", "ask", "times", "bids", "asks", "bidVolumes", "askVolumes"}
+                  if isinstance(payload, dict) and required.issubset(payload):
+                      n = len(payload["times"])
+                      if n > 0 and all(len(payload[k]) == n for k in ("bids", "asks", "bidVolumes", "askVolumes")):
+                          usable.append(f"jetta_ticks (HTTP 200 JSON; {n} ticks; structural check only)")
+                      elif n == 0:
+                          print("JETTA returned a structurally valid but empty tick array for the selected hour.")
+                  else:
+                      print("JETTA HTTP 200 response did not match the expected delta-encoded tick schema.")
+              except Exception as e:
+                  print("JETTA response is not valid expected JSON:", repr(e))
+          verdict = ("CONNECTIVITY_CANDIDATE\n" + "\n".join(usable) + "\n") if usable else "NO_USABLE_TICK_ENDPOINT\n"
+          (root / "VERDICT.txt").write_text(verdict)
+          print(verdict)
+          sys.exit(0 if usable else 1)
+          PY
+
+      - name: Upload endpoint evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dukascopy-endpoint-diagnostic
+          path: probe/
+          retention-days: 7
+          if-no-files-found: error
+          
