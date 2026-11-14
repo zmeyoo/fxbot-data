@@ -1,0 +1,149 @@
+# Dukascopy dataset builder (phone-friendly). Repository root needs exactly TWO things:
+#   1. this file at .github/workflows/dukascopy_dataset.yml
+#   2. the project archive (fxbot_phase3e.tar.gz, one file; the workflow unpacks it)
+# Artifacts: a small 'review-pack' (always) and, only if validated, 'dataset-normalised' (CSV) and 'dataset-raw-original' (byte-exact files).
+# Run: Actions tab -> "Dukascopy dataset" -> Run workflow (defaults = approved pilot 2024-03-04 .. 2024-03-18).
+# NOT YET EXECUTED on GitHub (the author has no network): the first run is the test of this file - see docs/DUKASCOPY_RUNBOOK.md.
+name: Dukascopy dataset
+run-name: Dukascopy ${{ inputs.instrument }} ${{ inputs.start }} to ${{ inputs.end }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      instrument:
+        description: "Instrument, 6 capital letters"
+        required: true
+        default: "EURUSD"
+        type: string
+      start:
+        description: "UTC start date, inclusive (YYYY-MM-DD)"
+        required: true
+        default: "2024-03-04"
+        type: string
+      end:
+        description: "UTC end date, exclusive (YYYY-MM-DD)"
+        required: true
+        default: "2024-03-18"
+        type: string
+      sleep:
+        description: "Seconds to wait between requests"
+        required: true
+        default: "0.3"
+        type: string
+      reference_range:
+        description: "Independent price-level check LO:HI for this period (EURUSD Mar 2024 was roughly 1.08-1.10)"
+        required: true
+        default: "1.05:1.12"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      INSTRUMENT: ${{ inputs.instrument }}
+      START: ${{ inputs.start }}
+      END: ${{ inputs.end }}
+      SLEEP: ${{ inputs.sleep }}
+      REFRANGE: ${{ inputs.reference_range }}
+      OUT: ${{ github.workspace }}/out
+      PYTHONPATH: .
+    steps:
+      - name: "Check out the repository"
+        uses: actions/checkout@v4
+
+      - name: "Check the inputs"
+        shell: bash
+        run: |
+          [[ "$INSTRUMENT" =~ ^[A-Z]{6}$ ]] || { echo "instrument must be 6 capital letters"; exit 1; }
+          [[ "$START" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "start must be YYYY-MM-DD"; exit 1; }
+          [[ "$END" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "end must be YYYY-MM-DD"; exit 1; }
+          [[ "$SLEEP" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "sleep must be a number"; exit 1; }
+          [[ "$REFRANGE" =~ ^[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "reference_range must look like 1.05:1.12"; exit 1; }
+
+      - name: "Unpack the project archive"
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=( *.tar.gz *.tgz *.tar )
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "Expected exactly ONE project archive (.tar.gz) in the repository root; found ${#files[@]}: ${files[*]:-none}"
+            exit 1
+          fi
+          mkdir -p work
+          tar xf "${files[0]}" -C work
+          test -f work/fxbot/tools/ci_run.sh || { echo "The archive does not contain fxbot/tools/ci_run.sh"; ls -R work | head -40; exit 1; }
+          echo "Unpacked ${files[0]}"
+
+      - name: "Set up Python 3.12"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Install the time-zone database"
+        run: python -m pip install --quiet tzdata
+
+      - name: "Run the pipeline (tests, network check, decoder verification, download, validation)"
+        id: pipeline
+        continue-on-error: true
+        working-directory: work/fxbot
+        shell: bash
+        run: bash tools/ci_run.sh "$OUT" "$INSTRUMENT" "$START" "$END" "$SLEEP" "$REFRANGE"
+
+      - name: "Verdict and review pack"
+        id: verdict
+        if: always()
+        working-directory: work/fxbot
+        shell: bash
+        run: python tools/ci_verdict.py --out "$OUT" --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT"
+
+      - name: "Upload the review pack (small: verdict, reports, logs, hashes)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-pack-${{ inputs.instrument }}-${{ inputs.start }}-${{ steps.verdict.outputs.status || 'NO-VERDICT' }}
+          path: out/review
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: "Upload the normalised CSV + manifest + reports (ONLY when validated)"
+        if: always() && steps.verdict.outputs.validated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-normalised-${{ inputs.instrument }}-${{ inputs.start }}-to-${{ inputs.end }}-VALIDATED
+          path: |
+            out/dataset/normalised
+            out/dataset/dataset.json
+            out/dataset/DATA_QUALITY_REPORT.md
+            out/dataset/DECODER_VERIFICATION.md
+            out/dataset/decoder_verification.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: "Upload the original raw tick files (ONLY when validated)"
+        if: always() && steps.verdict.outputs.validated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-raw-original-${{ inputs.instrument }}-${{ inputs.start }}-to-${{ inputs.end }}-VALIDATED
+          path: |
+            out/dataset/raw
+            out/dataset/verify_raw
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: "Fail the run unless the dataset is validated"
+        if: always()
+        shell: bash
+        env:
+          VERDICT_STATUS: ${{ steps.verdict.outputs.status }}
+          VERDICT_VALIDATED: ${{ steps.verdict.outputs.validated }}
+        run: |
+          if [ "$VERDICT_VALIDATED" != "true" ]; then
+            echo "NOT VALIDATED (${VERDICT_STATUS:-no verdict}). Do not use any data from this run."
+            exit 1
+          fi
+          echo "Validated."
